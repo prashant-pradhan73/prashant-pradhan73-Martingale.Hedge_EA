@@ -1,5 +1,5 @@
 //+------------------------------------------------------------------+
-//| MartingaleEA_V19.3.mq5 — Martingale Grid + Full Hedge System    |
+//| MartingaleEA_V20.4.mq5 — Martingale Grid + Full Hedge System    |
 //| Copyright 2026, MetaQuotes Ltd.                                  |
 //| https://www.mql5.com                                             |
 //+------------------------------------------------------------------+
@@ -20,13 +20,17 @@ input double BasketProfitUSD   = 5.0;     // Target profit per basket (USD)
 input double TPBufferUSD       = 1.0;     // Safety buffer above break-even (USD)
 
 //--- Hedge inputs
-input double HedgeMultiplier   = 1.0;     // Hedge lots = basket total * this (1.0–1.3)
-input double HedgeRetracePct   = 20.0;    // Retrace % before closing hedge (0–100)
-input int    HedgeTriggerLevel = 6;       // Open hedge after this many grid levels
+input double HedgeMultiplier     = 1.0;     // Hedge lots = basket total * this (1.0–1.3)
+input double HedgeRetracePct     = 20.0;    // Retrace % before closing hedge (0–100)
+input int    HedgeTriggerLevel   = 6;       // Open hedge after this many grid levels
+input double MinHedgeRange       = 5.0;     // Minimum points before retrace check
+input int    MinHedgeHoldSeconds = 300;     // Hold hedge at least 5 minutes before close
+input double SafetyBufferPts     = 5.0;     // Buffer below trough before safety stop (pts)
 
 //--- Risk inputs
 input double MaxCycleLossUSD   = 1500.0;  // Max loss per basket before force-close
-input int    MaxSpreadPoints   = 80;      // Max allowed spread in points
+input int    MaxSpreadPoints   = 300;     // Max allowed spread in points (300 for GOLD)
+input double MinMarginLevel    = 200.0;   // Minimum margin level % before blocking orders
 
 //--- Magic number offsets (runtime, set in OnInit)
 ulong g_MagicBuyBasket;
@@ -48,6 +52,14 @@ double g_SellHedgePrice   = 0.0;
 double g_SellHighestPrice = 0.0;   // highest ask tracked while hedge active
 double g_SellHedgeProfit  = 0.0;
 
+//--- Hedge open timestamps (for MinHedgeHoldSeconds)
+datetime g_BuyHedgeOpenTime  = 0;
+datetime g_SellHedgeOpenTime = 0;
+
+//--- TP modify fail counters (for software TP fallback)
+int g_BuyTPFailCount  = 0;
+int g_SellTPFailCount = 0;
+
 //--- Spread gate throttle
 datetime g_LastSpreadLog = 0;
 
@@ -67,6 +79,38 @@ int OnInit()
 
    trade.SetExpertMagicNumber(Magic);
    return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Check if market is open for trading                              |
+//+------------------------------------------------------------------+
+bool IsMarketOpen()
+{
+   ENUM_SYMBOL_TRADE_MODE mode =
+      (ENUM_SYMBOL_TRADE_MODE)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_MODE);
+   if(mode != SYMBOL_TRADE_MODE_FULL)
+      return false;
+
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   if(bid <= 0.0 || ask <= 0.0)
+      return false;
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Margin level guard — block new orders when margin is low         |
+//+------------------------------------------------------------------+
+bool IsMarginOK()
+{
+   double marginLevel = AccountInfoDouble(ACCOUNT_MARGIN_LEVEL);
+   if(marginLevel > 0.0 && marginLevel < MinMarginLevel)
+   {
+      Print("MARGIN GUARD: Margin level ", marginLevel, "% — blocking new orders");
+      return false;
+   }
+   return true;
 }
 
 //+------------------------------------------------------------------+
@@ -264,22 +308,63 @@ bool IsSpreadOK()
 }
 
 //+------------------------------------------------------------------+
+//| Validate TP against broker's minimum stops distance             |
+//+------------------------------------------------------------------+
+bool IsTPValid(bool isBuy, double tp)
+{
+   double stopsLevelPts = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+   if(stopsLevelPts < _Point) stopsLevelPts = _Point;
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   if( isBuy && tp < ask + stopsLevelPts) return false;
+   if(!isBuy && tp > bid - stopsLevelPts) return false;
+   return true;
+}
+
+//+------------------------------------------------------------------+
 //| Set TP on every open position in a basket                        |
 //+------------------------------------------------------------------+
 void SetBasketTP(ulong magic, bool buy, double tp)
 {
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   // Fix: Validate TP against SYMBOL_TRADE_STOPS_LEVEL before any modify
+   if(!IsTPValid(buy, tp))
+   {
+      PrintFormat("STOPS_LEVEL: TP %.5f rejected for %s basket — too close to price",
+                  tp, buy ? "BUY" : "SELL");
+      if(buy) g_BuyTPFailCount++;
+      else    g_SellTPFailCount++;
+      return;
+   }
+
+   bool anyModified = false;
    for(int i = 0; i < PositionsTotal(); i++)
    {
       ulong ticket = PositionGetTicket(i);
       if(!PositionSelectByTicket(ticket)) continue;
       if(PositionGetInteger(POSITION_MAGIC) != (long)magic) continue;
       int type = (int)PositionGetInteger(POSITION_TYPE);
-      if( buy && type == POSITION_TYPE_BUY  && tp > ask)
-         trade.PositionModify(ticket, 0, tp);
-      if(!buy && type == POSITION_TYPE_SELL && tp < bid)
-         trade.PositionModify(ticket, 0, tp);
+      bool match = ( buy && type == POSITION_TYPE_BUY) ||
+                   (!buy && type == POSITION_TYPE_SELL);
+      if(!match) continue;
+
+      // Fix: Skip if TP is already set correctly (avoids [Invalid stops] spam)
+      double currentTP = PositionGetDouble(POSITION_TP);
+      if(MathAbs(currentTP - tp) < _Point)
+         continue;
+
+      if(trade.PositionModify(ticket, 0, tp))
+         anyModified = true;
+      else
+      {
+         if(buy) g_BuyTPFailCount++;
+         else    g_SellTPFailCount++;
+      }
+   }
+   // Reset fail counter only when at least one modify succeeded
+   if(anyModified)
+   {
+      if(buy) g_BuyTPFailCount = 0;
+      else    g_SellTPFailCount = 0;
    }
 }
 
@@ -336,6 +421,8 @@ void AdjustSellBasketTP()
 //+------------------------------------------------------------------+
 void OpenBuyHedge()
 {
+   if(!IsMarginOK()) return;
+
    double totalLots = SumLotsByMagic(g_MagicBuyBasket, true);
    double hedgeLots = NormalizeDouble(totalLots * HedgeMultiplier, 2);
    if(hedgeLots < 0.01) hedgeLots = 0.01;
@@ -345,11 +432,12 @@ void OpenBuyHedge()
    trade.SetExpertMagicNumber(g_MagicBuyHedge);
    if(trade.Sell(hedgeLots, _Symbol, bid, 0, 0))
    {
-      g_BuyHedgeActive = true;
-      g_BuyHedgeDone   = true;   // hedge opened this cycle — no second hedge allowed
-      g_BuyHedgePrice  = bid;
-      g_BuyLowestPrice = bid;
-      g_BuyHedgeProfit = 0.0;
+      g_BuyHedgeActive  = true;
+      g_BuyHedgeDone    = true;   // hedge opened this cycle — no second hedge allowed
+      g_BuyHedgePrice   = bid;
+      g_BuyLowestPrice  = bid;
+      g_BuyHedgeProfit  = 0.0;
+      g_BuyHedgeOpenTime = TimeCurrent();
       DeleteAllPendingsByMagic(g_MagicBuyBasket); // stop grid expansion
       PrintFormat("BUY HEDGE OPENED: %.2f lots SELL @ %.5f", hedgeLots, bid);
    }
@@ -361,6 +449,8 @@ void OpenBuyHedge()
 //+------------------------------------------------------------------+
 void OpenSellHedge()
 {
+   if(!IsMarginOK()) return;
+
    double totalLots = SumLotsByMagic(g_MagicSellBasket, false);
    double hedgeLots = NormalizeDouble(totalLots * HedgeMultiplier, 2);
    if(hedgeLots < 0.01) hedgeLots = 0.01;
@@ -370,11 +460,12 @@ void OpenSellHedge()
    trade.SetExpertMagicNumber(g_MagicSellHedge);
    if(trade.Buy(hedgeLots, _Symbol, ask, 0, 0))
    {
-      g_SellHedgeActive  = true;
-      g_SellHedgeDone    = true;   // hedge opened this cycle — no second hedge allowed
-      g_SellHedgePrice   = ask;
-      g_SellHighestPrice = ask;
-      g_SellHedgeProfit  = 0.0;
+      g_SellHedgeActive   = true;
+      g_SellHedgeDone     = true;   // hedge opened this cycle — no second hedge allowed
+      g_SellHedgePrice    = ask;
+      g_SellHighestPrice  = ask;
+      g_SellHedgeProfit   = 0.0;
+      g_SellHedgeOpenTime = TimeCurrent();
       DeleteAllPendingsByMagic(g_MagicSellBasket); // stop grid expansion
       PrintFormat("SELL HEDGE OPENED: %.2f lots BUY @ %.5f", hedgeLots, ask);
    }
@@ -442,17 +533,23 @@ void ManageBuyHedge()
       // Track lowest price while hedge is open
       if(bid < g_BuyLowestPrice) g_BuyLowestPrice = bid;
 
+      // MinHedgeHoldSeconds: don't close hedge until it has been open long enough
+      if((int)(TimeCurrent() - g_BuyHedgeOpenTime) < MinHedgeHoldSeconds)
+         return;
+
       // Retrace check: close hedge when price recovers HedgeRetracePct of the range
       double range = g_BuyHedgePrice - g_BuyLowestPrice;
-      if(range > 0.0)
+
+      // MinHedgeRange: price must have moved at least this far before retrace check
+      if(range < MinHedgeRange * _Point)
+         return;
+
+      double retracePrice = g_BuyLowestPrice + range * (HedgeRetracePct / 100.0);
+      if(bid >= retracePrice)
       {
-         double retracePrice = g_BuyLowestPrice + range * (HedgeRetracePct / 100.0);
-         if(bid >= retracePrice)
-         {
-            PrintFormat("BUY HEDGE RETRACE HIT: Entry=%.5f Trough=%.5f Retrace=%.5f Bid=%.5f",
-                        g_BuyHedgePrice, g_BuyLowestPrice, retracePrice, bid);
-            CloseBuyHedge();
-         }
+         PrintFormat("BUY HEDGE RETRACE HIT: Entry=%.5f Trough=%.5f Retrace=%.5f Bid=%.5f",
+                     g_BuyHedgePrice, g_BuyLowestPrice, retracePrice, bid);
+         CloseBuyHedge();
       }
    }
    else if(!g_BuyHedgeDone)
@@ -467,18 +564,20 @@ void ManageBuyHedge()
    else
    {
       // Recovery phase: hedge is done — watch for safety-stop condition.
-      // If price makes a new low below the trough recorded during the hedge,
-      // accept the loss and start a fresh cycle.
-      if(g_BuyLowestPrice > 0.0 && bid < g_BuyLowestPrice)
+      // SafetyBufferPts: give a buffer below the trough before forcing a reset.
+      double safetyStop = g_BuyLowestPrice - SafetyBufferPts * _Point;
+      if(g_BuyLowestPrice > 0.0 && bid < safetyStop)
       {
-         PrintFormat("BUY SAFETY STOP: bid %.5f < trough %.5f — closing basket",
-                     bid, g_BuyLowestPrice);
+         PrintFormat("BUY SAFETY STOP: bid %.5f < safetyStop %.5f (trough %.5f - %.1f pts) — closing basket",
+                     bid, safetyStop, g_BuyLowestPrice, SafetyBufferPts);
          CloseAllByMagic(g_MagicBuyBasket, true);
          DeleteAllPendingsByMagic(g_MagicBuyBasket);
-         g_BuyHedgeDone   = false;
-         g_BuyHedgeProfit = 0.0;
-         g_BuyLowestPrice = 0.0;
-         g_BuyHedgePrice  = 0.0;
+         g_BuyHedgeDone    = false;
+         g_BuyHedgeProfit  = 0.0;
+         g_BuyLowestPrice  = 0.0;
+         g_BuyHedgePrice   = 0.0;
+         g_BuyHedgeOpenTime = 0;
+         g_BuyTPFailCount  = 0;
       }
    }
 }
@@ -495,16 +594,22 @@ void ManageSellHedge()
    {
       if(ask > g_SellHighestPrice) g_SellHighestPrice = ask;
 
+      // MinHedgeHoldSeconds: don't close hedge until it has been open long enough
+      if((int)(TimeCurrent() - g_SellHedgeOpenTime) < MinHedgeHoldSeconds)
+         return;
+
       double range = g_SellHighestPrice - g_SellHedgePrice;
-      if(range > 0.0)
+
+      // MinHedgeRange: price must have moved at least this far before retrace check
+      if(range < MinHedgeRange * _Point)
+         return;
+
+      double retracePrice = g_SellHighestPrice - range * (HedgeRetracePct / 100.0);
+      if(ask <= retracePrice)
       {
-         double retracePrice = g_SellHighestPrice - range * (HedgeRetracePct / 100.0);
-         if(ask <= retracePrice)
-         {
-            PrintFormat("SELL HEDGE RETRACE HIT: Entry=%.5f Peak=%.5f Retrace=%.5f Ask=%.5f",
-                        g_SellHedgePrice, g_SellHighestPrice, retracePrice, ask);
-            CloseSellHedge();
-         }
+         PrintFormat("SELL HEDGE RETRACE HIT: Entry=%.5f Peak=%.5f Retrace=%.5f Ask=%.5f",
+                     g_SellHedgePrice, g_SellHighestPrice, retracePrice, ask);
+         CloseSellHedge();
       }
    }
    else if(!g_SellHedgeDone)
@@ -517,16 +622,20 @@ void ManageSellHedge()
    }
    else
    {
-      if(g_SellHighestPrice > 0.0 && ask > g_SellHighestPrice)
+      // Recovery phase — SafetyBufferPts: give a buffer above the peak before safety stop.
+      double safetyStop = g_SellHighestPrice + SafetyBufferPts * _Point;
+      if(g_SellHighestPrice > 0.0 && ask > safetyStop)
       {
-         PrintFormat("SELL SAFETY STOP: ask %.5f > peak %.5f — closing basket",
-                     ask, g_SellHighestPrice);
+         PrintFormat("SELL SAFETY STOP: ask %.5f > safetyStop %.5f (peak %.5f + %.1f pts) — closing basket",
+                     ask, safetyStop, g_SellHighestPrice, SafetyBufferPts);
          CloseAllByMagic(g_MagicSellBasket, false);
          DeleteAllPendingsByMagic(g_MagicSellBasket);
-         g_SellHedgeDone    = false;
-         g_SellHedgeProfit  = 0.0;
-         g_SellHighestPrice = 0.0;
-         g_SellHedgePrice   = 0.0;
+         g_SellHedgeDone     = false;
+         g_SellHedgeProfit   = 0.0;
+         g_SellHighestPrice  = 0.0;
+         g_SellHedgePrice    = 0.0;
+         g_SellHedgeOpenTime = 0;
+         g_SellTPFailCount   = 0;
       }
    }
 }
@@ -549,11 +658,13 @@ void CheckMaxCycleLoss()
          CloseAllByMagic(g_MagicBuyBasket, true);
          CloseAllByMagic(g_MagicBuyHedge, false);
          DeleteAllPendingsByMagic(g_MagicBuyBasket);
-         g_BuyHedgeActive = false;
-         g_BuyHedgeDone   = false;
-         g_BuyHedgeProfit = 0.0;
-         g_BuyLowestPrice = 0.0;
-         g_BuyHedgePrice  = 0.0;
+         g_BuyHedgeActive  = false;
+         g_BuyHedgeDone    = false;
+         g_BuyHedgeProfit  = 0.0;
+         g_BuyLowestPrice  = 0.0;
+         g_BuyHedgePrice   = 0.0;
+         g_BuyHedgeOpenTime = 0;
+         g_BuyTPFailCount  = 0;
       }
    }
 
@@ -570,11 +681,13 @@ void CheckMaxCycleLoss()
          CloseAllByMagic(g_MagicSellBasket, false);
          CloseAllByMagic(g_MagicSellHedge, true);
          DeleteAllPendingsByMagic(g_MagicSellBasket);
-         g_SellHedgeActive  = false;
-         g_SellHedgeDone    = false;
-         g_SellHedgeProfit  = 0.0;
-         g_SellHighestPrice = 0.0;
-         g_SellHedgePrice   = 0.0;
+         g_SellHedgeActive   = false;
+         g_SellHedgeDone     = false;
+         g_SellHedgeProfit   = 0.0;
+         g_SellHighestPrice  = 0.0;
+         g_SellHedgePrice    = 0.0;
+         g_SellHedgeOpenTime = 0;
+         g_SellTPFailCount   = 0;
       }
    }
 }
@@ -584,29 +697,37 @@ void CheckMaxCycleLoss()
 //+------------------------------------------------------------------+
 void StartBuyCycle()
 {
+   if(!IsMarginOK()) { g_TradeLock = false; return; }
+
    double ask       = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double firstTP   = ask + GridStep;
    double stopLevel = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
 
    trade.SetExpertMagicNumber(g_MagicBuyBasket);
-   if(trade.Buy(StartLot, _Symbol, ask, 0, firstTP))
+   if(!trade.Buy(StartLot, _Symbol, ask, 0, firstTP))
    {
-      double nextPrice  = ask - GridStep;
-      double nextLot    = NormalizeDouble(StartLot * LotMultiplier, 2);
-      if(MathAbs(ask - nextPrice) > stopLevel &&
-         !PendingAtPrice(g_MagicBuyBasket, ORDER_TYPE_BUY_LIMIT, nextPrice))
-      {
-         trade.BuyLimit(nextLot, nextPrice, _Symbol);
-      }
+      trade.SetExpertMagicNumber(Magic);
+      g_TradeLock = false;   // allow retry on next tick
+      return;
+   }
+
+   double nextPrice  = ask - GridStep;
+   double nextLot    = NormalizeDouble(StartLot * LotMultiplier, 2);
+   if(MathAbs(ask - nextPrice) > stopLevel &&
+      !PendingAtPrice(g_MagicBuyBasket, ORDER_TYPE_BUY_LIMIT, nextPrice))
+   {
+      trade.BuyLimit(nextLot, nextPrice, _Symbol);
    }
    trade.SetExpertMagicNumber(Magic);
 
    // Reset hedge state for the new cycle
-   g_BuyHedgeActive = false;
-   g_BuyHedgeDone   = false;
-   g_BuyHedgeProfit = 0.0;
-   g_BuyLowestPrice = 0.0;
-   g_BuyHedgePrice  = 0.0;
+   g_BuyHedgeActive  = false;
+   g_BuyHedgeDone    = false;
+   g_BuyHedgeProfit  = 0.0;
+   g_BuyLowestPrice  = 0.0;
+   g_BuyHedgePrice   = 0.0;
+   g_BuyHedgeOpenTime = 0;
+   g_BuyTPFailCount  = 0;
 }
 
 //+------------------------------------------------------------------+
@@ -614,28 +735,36 @@ void StartBuyCycle()
 //+------------------------------------------------------------------+
 void StartSellCycle()
 {
+   if(!IsMarginOK()) { g_TradeLock = false; return; }
+
    double bid       = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double firstTP   = bid - GridStep;
    double stopLevel = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
 
    trade.SetExpertMagicNumber(g_MagicSellBasket);
-   if(trade.Sell(StartLot, _Symbol, bid, 0, firstTP))
+   if(!trade.Sell(StartLot, _Symbol, bid, 0, firstTP))
    {
-      double nextPrice = bid + GridStep;
-      double nextLot   = NormalizeDouble(StartLot * LotMultiplier, 2);
-      if(MathAbs(nextPrice - bid) > stopLevel &&
-         !PendingAtPrice(g_MagicSellBasket, ORDER_TYPE_SELL_LIMIT, nextPrice))
-      {
-         trade.SellLimit(nextLot, nextPrice, _Symbol);
-      }
+      trade.SetExpertMagicNumber(Magic);
+      g_TradeLock = false;   // allow retry on next tick
+      return;
+   }
+
+   double nextPrice = bid + GridStep;
+   double nextLot   = NormalizeDouble(StartLot * LotMultiplier, 2);
+   if(MathAbs(nextPrice - bid) > stopLevel &&
+      !PendingAtPrice(g_MagicSellBasket, ORDER_TYPE_SELL_LIMIT, nextPrice))
+   {
+      trade.SellLimit(nextLot, nextPrice, _Symbol);
    }
    trade.SetExpertMagicNumber(Magic);
 
-   g_SellHedgeActive  = false;
-   g_SellHedgeDone    = false;
-   g_SellHedgeProfit  = 0.0;
-   g_SellHighestPrice = 0.0;
-   g_SellHedgePrice   = 0.0;
+   g_SellHedgeActive   = false;
+   g_SellHedgeDone     = false;
+   g_SellHedgeProfit   = 0.0;
+   g_SellHighestPrice  = 0.0;
+   g_SellHedgePrice    = 0.0;
+   g_SellHedgeOpenTime = 0;
+   g_SellTPFailCount   = 0;
 }
 
 //+------------------------------------------------------------------+
@@ -649,10 +778,15 @@ void HandleBuyFill(double price)
    if(levels >= 2)
       SetBasketTP(g_MagicBuyBasket, true, price + GridStep);
 
-   // Stop placing new grid orders when hedge is active, HedgeTriggerLevel reached,
-   // or hard MaxLevels cap hit
-   if(g_BuyHedgeActive || levels >= HedgeTriggerLevel || levels >= MaxLevels)
+   // Absolute grid cap: no new levels once hedge triggered or hard cap reached
+   if(g_BuyHedgeActive || g_BuyHedgeDone || levels >= MaxLevels)
       return;
+
+   // Also block if HedgeTriggerLevel reached (hedge about to open this tick)
+   if(levels >= HedgeTriggerLevel)
+      return;
+
+   if(!IsMarginOK()) return;
 
    double nextPrice  = price - GridStep;
    double lot        = NextLot(g_MagicBuyBasket, true);
@@ -679,8 +813,15 @@ void HandleSellFill(double price)
    if(levels >= 2)
       SetBasketTP(g_MagicSellBasket, false, price - GridStep);
 
-   if(g_SellHedgeActive || levels >= HedgeTriggerLevel || levels >= MaxLevels)
+   // Absolute grid cap: no new levels once hedge triggered or hard cap reached
+   if(g_SellHedgeActive || g_SellHedgeDone || levels >= MaxLevels)
       return;
+
+   // Also block if HedgeTriggerLevel reached (hedge about to open this tick)
+   if(levels >= HedgeTriggerLevel)
+      return;
+
+   if(!IsMarginOK()) return;
 
    double nextPrice = price + GridStep;
    double lot       = NextLot(g_MagicSellBasket, false);
@@ -728,6 +869,9 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   // Skip everything if market is closed (Sunday gap, holidays)
+   if(!IsMarketOpen()) return;
+
    if(!IsSpreadOK()) return;
 
    CheckMaxCycleLoss();
@@ -739,14 +883,36 @@ void OnTick()
    if(buyCount > 0)
    {
       ManageBuyHedge();
+
+      // Software TP fallback: if broker keeps rejecting TP modifies, close at market
+      if(g_BuyTPFailCount >= 3)
+      {
+         double pnl = BasketPnL(g_MagicBuyBasket, true) + g_BuyHedgeProfit;
+         if(pnl >= BasketProfitUSD)
+         {
+            PrintFormat("SOFTWARE TP: Closing buy basket at market — PnL=%.2f", pnl);
+            CloseAllByMagic(g_MagicBuyBasket, true);
+            CloseAllByMagic(g_MagicBuyHedge, false);
+            DeleteAllPendingsByMagic(g_MagicBuyBasket);
+            g_BuyHedgeActive  = false;
+            g_BuyHedgeDone    = false;
+            g_BuyHedgeProfit  = 0.0;
+            g_BuyLowestPrice  = 0.0;
+            g_BuyHedgePrice   = 0.0;
+            g_BuyHedgeOpenTime = 0;
+            g_BuyTPFailCount  = 0;
+         }
+      }
    }
    else if(buyHedgeCount > 0)
    {
       // Basket gone but hedge orphaned — close it then start fresh next tick
       CloseAllByMagic(g_MagicBuyHedge, false);
       DeleteAllPendingsByMagic(g_MagicBuyBasket);
-      g_BuyHedgeActive = false;
-      g_BuyHedgeDone   = false;
+      g_BuyHedgeActive  = false;
+      g_BuyHedgeDone    = false;
+      g_BuyHedgeOpenTime = 0;
+      g_BuyTPFailCount  = 0;
    }
    else if(!g_TradeLock)
    {
@@ -762,13 +928,35 @@ void OnTick()
    if(sellCount > 0)
    {
       ManageSellHedge();
+
+      // Software TP fallback: if broker keeps rejecting TP modifies, close at market
+      if(g_SellTPFailCount >= 3)
+      {
+         double pnl = BasketPnL(g_MagicSellBasket, false) + g_SellHedgeProfit;
+         if(pnl >= BasketProfitUSD)
+         {
+            PrintFormat("SOFTWARE TP: Closing sell basket at market — PnL=%.2f", pnl);
+            CloseAllByMagic(g_MagicSellBasket, false);
+            CloseAllByMagic(g_MagicSellHedge, true);
+            DeleteAllPendingsByMagic(g_MagicSellBasket);
+            g_SellHedgeActive   = false;
+            g_SellHedgeDone     = false;
+            g_SellHedgeProfit   = 0.0;
+            g_SellHighestPrice  = 0.0;
+            g_SellHedgePrice    = 0.0;
+            g_SellHedgeOpenTime = 0;
+            g_SellTPFailCount   = 0;
+         }
+      }
    }
    else if(sellHedgeCount > 0)
    {
       CloseAllByMagic(g_MagicSellHedge, true);
       DeleteAllPendingsByMagic(g_MagicSellBasket);
-      g_SellHedgeActive = false;
-      g_SellHedgeDone   = false;
+      g_SellHedgeActive   = false;
+      g_SellHedgeDone     = false;
+      g_SellHedgeOpenTime = 0;
+      g_SellTPFailCount   = 0;
    }
    else if(!g_TradeLock)
    {
